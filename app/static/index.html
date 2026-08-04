@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>감사 체크리스트 생성 에이전트</title>
+<style>
+  body { font-family: -apple-system, "Malgun Gothic", sans-serif; max-width: 900px; margin: 20px auto; background:#f7f7f8; }
+  #chat { background:#fff; border:1px solid #ddd; border-radius:8px; padding:16px; height:60vh; overflow-y:auto; }
+  .msg { margin:10px 0; padding:10px 14px; border-radius:8px; white-space:pre-wrap; }
+  .user { background:#daf1ff; margin-left:20%; }
+  .bot { background:#eee; margin-right:20%; }
+  #inputRow { display:flex; gap:8px; margin-top:10px; }
+  #inputRow input { flex:1; padding:10px; }
+  button { padding:10px 16px; cursor:pointer; }
+  #settings { margin-bottom:12px; font-size:13px; color:#333; background:#fff; border:1px solid #ddd; border-radius:8px; padding:10px; }
+  #settings label { display:inline-block; margin-right:10px; }
+  table { border-collapse: collapse; width:100%; margin-top:8px; font-size: 13px; }
+  th, td { border:1px solid #ccc; padding:4px 6px; text-align:left; }
+</style>
+</head>
+<body>
+  <h2>감사 체크리스트 생성 에이전트</h2>
+  <div id="settings">
+    <div><label>저장 폴더: <input id="saveDir" size="40"></label></div>
+    <div style="margin-top:6px;">
+      <label>LLM 연동:
+        <select id="llmProvider" onchange="onProviderChange()">
+          <option value="claude_code">Claude Code 활용 (API 키 불필요)</option>
+          <option value="anthropic_api">Anthropic API 키</option>
+          <option value="openai_api">OpenAI(GPT) API 키</option>
+        </select>
+      </label>
+    </div>
+    <div id="anthropicFields" style="margin-top:6px; display:none;">
+      <label>Anthropic API Key: <input id="anthropicKey" type="password" size="24" placeholder="설정된 경우 비워두면 유지"></label>
+      <label>모델: <input id="anthropicModel" size="20" placeholder="예: claude-sonnet-5"></label>
+    </div>
+    <div id="openaiFields" style="margin-top:6px; display:none;">
+      <label>OpenAI API Key: <input id="openaiKey" type="password" size="24" placeholder="설정된 경우 비워두면 유지"></label>
+      <label>모델: <input id="openaiModel" size="20" placeholder="예: gpt-4.1 (본인 계정에서 사용 가능한 모델 ID)"></label>
+    </div>
+    <div style="margin-top:8px;"><button onclick="saveSettings()">설정 저장</button></div>
+  </div>
+  <div id="chat"></div>
+  <div id="inputRow">
+    <input id="msgInput" placeholder="예: 26년 3월 신한은행 감사업무 시작" onkeydown="if(event.key==='Enter') send()">
+    <button onclick="send()">전송</button>
+  </div>
+
+<script>
+let lastParsed = null;
+
+function addMsg(text, cls) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls;
+  el.innerHTML = text;
+  document.getElementById('chat').appendChild(el);
+  document.getElementById('chat').scrollTop = 1e9;
+}
+
+function onProviderChange() {
+  const p = document.getElementById('llmProvider').value;
+  document.getElementById('anthropicFields').style.display = (p === 'anthropic_api') ? 'block' : 'none';
+  document.getElementById('openaiFields').style.display = (p === 'openai_api') ? 'block' : 'none';
+}
+
+async function loadSettings() {
+  const r = await fetch('/api/config').then(r => r.json());
+  document.getElementById('saveDir').value = r.save_dir;
+  document.getElementById('llmProvider').value = r.llm_provider;
+  document.getElementById('anthropicModel').value = r.anthropic_model || '';
+  document.getElementById('anthropicKey').placeholder = r.anthropic_api_key ? '설정됨 (변경 시에만 입력)' : 'Anthropic API 키 입력';
+  document.getElementById('openaiModel').value = r.openai_model || '';
+  document.getElementById('openaiKey').placeholder = r.openai_api_key ? '설정됨 (변경 시에만 입력)' : 'OpenAI API 키 입력';
+  onProviderChange();
+}
+loadSettings();
+
+async function saveSettings() {
+  const body = {
+    save_dir: document.getElementById('saveDir').value,
+    llm_provider: document.getElementById('llmProvider').value,
+    anthropic_model: document.getElementById('anthropicModel').value,
+    openai_model: document.getElementById('openaiModel').value,
+  };
+  const aKey = document.getElementById('anthropicKey').value;
+  if (aKey) body.anthropic_api_key = aKey;
+  const oKey = document.getElementById('openaiKey').value;
+  if (oKey) body.openai_api_key = oKey;
+  await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  addMsg('설정이 저장되었습니다.', 'bot');
+}
+
+async function send() {
+  const input = document.getElementById('msgInput');
+  const text = input.value.trim();
+  if (!text) return;
+  addMsg(text, 'user');
+  input.value = '';
+
+  const r = await fetch('/api/chat/parse', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message:text})}).then(r=>r.json());
+  addMsg(r.reply, 'bot');
+  if (r.ok) {
+    lastParsed = r.parsed;
+    addMsg(`<button onclick="startCrawl()">예, 크롤링 시작</button>`, 'bot');
+  }
+}
+
+async function startCrawl() {
+  const periodMsg = lastParsed.period ? `${lastParsed.period} 전후 자료만` : '전체 최신 자료를';
+  addMsg(`크롤링을 시작합니다... (${periodMsg} 수집)`, 'bot');
+  const r = await fetch('/api/crawl', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({industry: lastParsed.industry, period: lastParsed.period})}).then(r=>r.json());
+  if (!r.ok) { addMsg('오류: ' + r.error, 'bot'); return; }
+  addMsg(`크롤링 완료.\n검사업무안내서 ${r.summary['검사업무안내서']}건, 검사결과제재 ${r.summary['검사결과제재']}건, 경영유의사항 ${r.summary['경영유의사항']}건\n저장 위치: ${r.save_dir}`, 'bot');
+  addMsg(`<button onclick="genChecklist()">체크리스트 생성</button>`, 'bot');
+}
+
+async function genChecklist() {
+  addMsg('체크리스트를 생성합니다...', 'bot');
+  const r = await fetch('/api/checklist', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({industry: lastParsed.industry})}).then(r=>r.json());
+  if (!r.ok) {
+    addMsg('오류: ' + r.message, 'bot');
+  } else if (r.mode === 'anthropic_api' || r.mode === 'openai_api') {
+    addMsg(r.checklist.replace(/\n/g, '<br>'), 'bot');
+  } else {
+    addMsg(r.message, 'bot');
+    addMsg('<textarea style="width:100%;height:200px">' + r.prompt.slice(0,3000) + '...(생략)</textarea>', 'bot');
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 크롤링 결과물 (사용자마다 새로 생성, 용량 크고 감사 대상 원문 포함)
+data/
+
+# 개인 로컬 설정 (경로/키는 사용자별로 다름)
+user_config.json
+.claude/settings.local.json
+
+# OS
+Thumbs.db
+.DS_Store
