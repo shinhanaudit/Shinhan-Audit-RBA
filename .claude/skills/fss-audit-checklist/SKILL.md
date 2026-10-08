@@ -59,35 +59,37 @@ python -m crawler.fss_crawler <업권명> --out data --start <YYYY-MM-DD> --end 
 - 실행 후 stdout에 카테고리별 저장 건수가 출력된다. 0건인 카테고리가 있어도 정상일 수 있다(해당 기간에 실제로 게시물이 없을 수 있음) — 에러가 아니라면 계속 진행한다.
 - **저장소 루트에 `.venv` 폴더가 있으면(`install.ps1`/`install.bat`로 설치한 정상 환경) 항상 `.venv\Scripts\python.exe`(Windows) 또는 `.venv/bin/python`(macOS/Linux)를 명시적으로 사용한다.** `.venv`가 없거나 Python 인터프리터 경로가 여러 개인 환경이면 `pip install -r requirements.txt`가 된 인터프리터를 찾아 명시적으로 지정한다.
 
-## Phase 2.5: 금융보안원(FSEC) 보도자료 크롤링 (선택적)
+## Phase 2.5: 금융보안원(FSEC) 보도자료 수집 — 내장 브라우저 사용 (필수 단계)
 
-FSS 크롤링이 끝난 뒤 금융보안원(FSEC) 보도자료를 추가로 수집한다.
-FSEC는 전자금융·IT보안·사이버보안 분야 보도자료를 운영하며, IT·전산·보안 리스크 체크리스트 보강에 유용하다.
+FSS 크롤링이 끝나면 금융보안원(FSEC) 보도자료를 수집한다. 전자금융·IT보안·사이버보안 분야 자료라 IT·전산·보안 리스크 보강에 유용하다.
 
-**⚠️ FSEC WAF 차단**: 금융보안원은 TLS JA3 핑거프린트 기반 WAF를 운용해 Python 자동화 클라이언트를 차단한다.
-접속 실패(ECONNRESET) 시 크롤러가 경고를 출력하고 0건으로 종료한다 — FSEC 없이 FSS 자료만으로 감사 체크리스트를 정상 생성한다.
-WAF가 해제된 경우에만 아래 명령이 동작한다.
+**Python 크롤러(`crawler/fsec_crawler.py`)는 쓰지 않는다.** 금융보안원은 TLS JA3 핑거프린트 기반 WAF로 Python HTTP 클라이언트 자체를 차단한다. 속도 제한이 아니라 접속 방식 차단이라 기다리거나 재시도해도 풀리지 않는다(2026-10-08 실측: 1분 간격 5회 재시도 모두 0건). 반면 **Claude 데스크톱 앱의 내장 브라우저(`mcp__Claude_Browser__*`)로는 정상 접속된다.** 따라서 항상 아래 브라우저 절차로 수집하고, 내장 브라우저 도구가 이 세션에 없을 때만 FSEC 단계를 건너뛰고 사용자에게 그 사실을 알린다.
 
-```bash
-python -m crawler.fsec_crawler --out data --start <YYYY-MM-DD> --end <YYYY-MM-DD> --press-pages 3
-```
+**절차** (브라우저 도구를 처음 쓰기 전에 `anthropic-skills:built-in-browser` 스킬을 먼저 읽는다):
 
-수집 결과는 `data/FSEC/FSEC_보도자료/`에 저장된다.
+1. **게시판 열기**: `preview_start`에 `url: "https://www.fsec.or.kr/bbs/69"`를 넘겨 보도자료 게시판을 연다. 목록은 페이지가 `POST /bbs/list`(JSON) API로 불러오며, 본문 HTML(`contents`)과 등록일(`regDate`)이 목록 응답에 함께 들어 있다. 상세 페이지를 따로 열 필요가 없다.
+2. **목록 수집(백그라운드 루프)**: `javascript_tool`은 45초를 넘기면 타임아웃되고, API는 `pageSize`와 상관없이 한 페이지에 약 6건만 돌려준다. 그래서 루프를 기다리지 말고 백그라운드로 실행해 `window._fs`에 쌓는다. 서버 부담을 줄이려고 페이지 사이에 0.5초를 쉬고, 감사 시작일보다 오래된 글이 나오면 멈춘다:
+   ```js
+   window._fs = {}; window._fsDone = false;
+   (async () => { for (let p = 1; p <= 120; p++) {
+     const r = await fetch('/bbs/list', {method:'POST', headers:{'Content-Type':'application/json'},
+       body: JSON.stringify({menuNo:69, pagingSearchDto:{page:p, pageSize:6}})}).then(r => r.json());
+     const d = r.resultData || [];
+     for (const x of d) { const t = document.createElement('div'); t.innerHTML = x.contents || '';
+       window._fs[x.bbsNo] = {no:x.bbsNo, date:x.regDate, title:x.title, text:t.innerText.replace(/\s+/g,' ').trim()}; }
+     if (!d.length || d[d.length-1].regDate < '<감사시작일 YYYY-MM-DD>') break;
+     await new Promise(s => setTimeout(s, 500)); } window._fsDone = true; })(); 'started'
+   ```
+   이후 `await new Promise(s=>setTimeout(s,40000))`로 40초씩 기다리며 `window._fsDone`, 건수, 최소 등록일을 확인한다(3년치 약 220건 기준 3~4분 소요). 진행 상황을 사용자에게 짧게 알린다.
+3. **기간 필터·후보 추리기**: `window._fs`에서 감사기간(`--start`~`--end`) 안의 글만 골라 `등록일 | bbsNo | 제목` 목록을 받는다. 그중 감사 대상 업권·기관과 연관성이 높은 글(침해사고·취약점·정보보호 상시평가·수탁자 점검·망분리·클라우드·FDS·결제보안 등)을 후보로 추린다. 인사·채용·행사·봉사 등 감사와 무관한 글은 제외한다.
+4. **본문 받아 저장**: 후보의 `bbsNo` 목록으로 `JSON.stringify(ids.map(i => window._fs[i]))`를 반환받는다. 결과가 너무 길면 10건 안팎으로 나눠 받는다. 받은 JSON을 **요약하거나 줄이지 말고 그대로** 스크래치패드의 임시 `.json` 파일로 Write한 뒤 저장 스크립트를 실행한다. 출력 인코딩 오류를 막으려면 `-X utf8`을 붙인다:
+   ```bash
+   .venv/Scripts/python.exe -X utf8 .claude/skills/fss-audit-checklist/scripts/save_fsec_press.py <임시.json> data/FSEC/FSEC_보도자료
+   ```
+   크롤러와 같은 형식(`제목/등록일/출처/원문` 헤더 + 본문)의 `.txt`로 저장되므로 Phase 4에서 FSS 자료와 똑같이 읽을 수 있다. 첨부파일(hwp/pdf)은 받지 않는다. 브라우저 다운로드는 사용자 허락이 필요한 동작이고, 본문 텍스트만으로 근거가 충분하기 때문이다.
+5. **반영 여부는 사용자 선택 필수**: 후보를 2~4개 주제 묶음으로 나눠 `AskUserQuestion`(multiSelect)으로 반영할 묶음을 묻는다. 묶음마다 `[신규]`/`[수정]` 예정 항목과 근거 보도자료(등록일)를 적는다. 사용자가 고른 묶음만 Phase 4/5에서 2.5순위 근거로 반영한다. 근거 컬럼에는 `[FSEC] 금융보안원 보도자료(YYYY.M.D.) 제목` 형식을 쓴다.
 
-`--keywords` 옵션으로 특정 업권 관련 키워드를 추가 필터링할 수 있다:
-```bash
-python -m crawler.fsec_crawler --out data --start <YYYY-MM-DD> --end <YYYY-MM-DD> --keywords 전자금융 사이버보안 이상거래
-```
-키워드 없이 실행하면 `ALWAYS_RELEVANT_KEYWORDS`(전자금융/사이버보안/정보보호/IT보안/개인정보/보안취약점/전산사고/API보안/클라우드보안) 기본 필터 적용.
-
-**크롤링 성공 시 선택적 반영 (사용자 선택 필수)**:
-
-1. `data/FSEC/FSEC_보도자료/`의 `.txt` 파일을 스캔해 수집된 보도자료 제목 목록을 확인한다.
-2. 현재 체크리스트와 연관성 높은 보도자료(IT보안, 전자금융 취약점, 접근통제, 망분리 등)를 후보로 추린다.
-3. 채팅에 후보 목록을 표시하고 반영 여부를 사용자에게 확인한다.
-4. 사용자가 선택한 항목만 Phase 4에서 체크리스트의 2.5순위 근거로 반영한다.
-
-**크롤링 실패(WAF 차단) 시**: 경고 메시지만 출력하고 Phase 3으로 바로 이동한다. 사용자에게 따로 알릴 필요 없음(크롤러 출력에 이미 안내됨).
+**브라우저 접속 자체가 실패할 때**(사이트 승인 거부, 페이지 오류 등): 재시도하지 말고 사용자에게 알린 뒤 FSS 자료만으로 Phase 3에 진행한다.
 
 ## Phase 3: 텍스트 추출
 
@@ -209,6 +211,6 @@ python .claude/skills/fss-audit-checklist/scripts/extract_text.py data/<업권�
 
 ## 테스트 시나리오
 
-**정상 흐름**: "26년 3월 신한은행 감사업무 시작" → 기관명(신한은행)·업권(은행)·감사기간(2026-03-01~2026-03-31) 확인 질문 → 사용자 승인 → FSS `--start/--end/--company --sanction-years 3` 크롤링(검사업무안내서/제재/경영유의사항 최근 3년) → FSEC 크롤링 → FSEC 검사업무안내서 후보 소제목 제시·사용자 선택 → 텍스트 추출 → 원문 근거+법령근거 기반 40개 내외 표 생성 → 사용자가 2개 항목 보강 요청 → 해당 항목만 수정한 전체 표 재출력.
+**정상 흐름**: "26년 3월 신한은행 감사업무 시작" → 기관명(신한은행)·업권(은행)·감사기간(2026-03-01~2026-03-31) 확인 질문 → 사용자 승인 → FSS `--start/--end/--company --sanction-years 3` 크롤링(검사업무안내서/제재/경영유의사항 최근 3년) → 내장 브라우저로 FSEC 보도자료 수집(/bbs/list API) → 후보 묶음 제시·사용자 선택 → 텍스트 추출 → 원문 근거+법령근거 기반 40개 내외 표 생성 → 사용자가 2개 항목 보강 요청 → 해당 항목만 수정한 전체 표 재출력.
 
-**에러 흐름**: 특정 업권에 검사업무안내서가 0건인 경우 → 크롤링은 정상 완료(0건)로 처리하고, 제재/경영유의사항만으로 보강 자료 위주 표를 만들되 "검사업무안내서 원문이 부족해 제재사례 중심으로 작성했다"고 명시한다. hwp5txt 미설치로 hwp 추출이 스킵된 경우 → pdf 근거만으로 표를 만들고 그 사실을 사용자에게 알린다. **FSEC 크롤링 0건(WAF 차단)**: 크롤러 출력에 안내 메시지가 이미 표시되므로 별도 알림 없이 FSS 자료만으로 진행한다.
+**에러 흐름**: 특정 업권에 검사업무안내서가 0건인 경우 → 크롤링은 정상 완료(0건)로 처리하고, 제재/경영유의사항만으로 보강 자료 위주 표를 만들되 "검사업무안내서 원문이 부족해 제재사례 중심으로 작성했다"고 명시한다. hwp5txt 미설치로 hwp 추출이 스킵된 경우 → pdf 근거만으로 표를 만들고 그 사실을 사용자에게 알린다. **FSEC 수집 실패**: Python 크롤러는 WAF로 항상 0건이므로 쓰지 않는다. 내장 브라우저 도구가 없거나 사이트 접속이 거부되면 사용자에게 알리고 FSS 자료만으로 진행한다.
