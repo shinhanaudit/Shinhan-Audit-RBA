@@ -140,41 +140,56 @@ class FssCrawler:
     def fetch_manuals(self, industry: str, max_pages: int = 5, years: list[str] | None = None) -> list[Document]:
         code = INDUSTRY_CODES[industry]
         docs: list[Document] = []
-        # 게시판이 연도(selectDate) 단위로만 필터링을 지원하므로, 대상 연도가 여러 개면 연도별로 순회한다.
         year_values = years or [None]
         for year in year_values:
-            docs.extend(self._fetch_manuals_for_year(code, max_pages, year))
+            fetched = self._fetch_manuals_for_year(code, max_pages, year)
+            docs.extend(fetched)
+        # 연도 필터 결과가 0건이면 필터 없이 최신 max_pages 페이지를 재수집한다.
+        # (검사업무안내서는 연 1~2회 갱신되므로 감사기간 연도에 신규 버전이 없을 수 있다.)
+        if not docs and years:
+            docs.extend(self._fetch_manuals_for_year(code, max_pages, None))
         return docs
 
     def _fetch_manuals_for_year(self, code: str, max_pages: int, year: str | None) -> list[Document]:
         docs: list[Document] = []
+        _year = year  # 첫 시도용 연도 (None이면 필터 없음)
         for page in range(1, max_pages + 1):
             params = {"menuNo": "200177", "selectCate": code, "pageIndex": page}
-            if year:
-                params["selectDate"] = year
+            if _year:
+                params["selectDate"] = _year
             soup = self._get(MANUAL_LIST_URL, params=params)
-            rows = soup.select(".bd-list table tbody tr")
+            # 현재 사이트 구조: <table class="tbl col list-data">
+            rows = soup.select("table.list-data tbody tr")
             if not rows:
                 break
             for row in rows:
-                title_a = row.select_one("td.title a")
+                cells = row.find_all("td")
+                if len(cells) < 5:
+                    continue
+                # td[2]: 제목(링크), td[3]: 담당부서, td[4]: 등록일, td[5]: 첨부파일
+                title_a = cells[2].find("a")
                 if not title_a:
                     continue
                 title = title_a.get_text(strip=True)
                 detail_url = urljoin(BASE_URL, title_a["href"])
-                dept = row.select_one("td:nth-of-type(4)")
-                date = row.select_one("td:nth-of-type(5)")
+                dept = cells[3].get_text(strip=True)
+                date_text = cells[4].get_text(strip=True)
                 doc = Document(
                     category="검사업무안내서",
                     title=title,
                     detail_url=detail_url,
-                    dept=dept.get_text(strip=True) if dept else "",
-                    date=date.get_text(strip=True) if date else "",
+                    dept=dept,
+                    date=date_text,
                 )
-                for a in row.select("a.file-single"):
-                    doc.attachments.append(
-                        Attachment(title=a.get("title", "첨부파일"), url=urljoin(BASE_URL, a["href"]))
-                    )
+                # td[5]: 첨부파일 다운로드 링크
+                if len(cells) > 5:
+                    for a in cells[5].find_all("a", href=True):
+                        href = a["href"]
+                        if _is_file_link(href) or "fileDown" in href or "hpdownload" in href:
+                            name = a.get("title") or a.get_text(strip=True) or "첨부파일"
+                            doc.attachments.append(
+                                Attachment(title=name[:80], url=urljoin(BASE_URL, href))
+                            )
                 docs.append(doc)
         return docs
 
@@ -196,7 +211,7 @@ class FssCrawler:
             if edate:
                 params["edate"] = edate
             soup = self._get(SANCTION_LIST_URL, params=params)
-            rows = soup.select(".bd-list table tbody tr")
+            rows = soup.select("table.list-data tbody tr")
             if not rows:
                 break
             for row in rows:
@@ -245,7 +260,7 @@ class FssCrawler:
             if edate:
                 params["edate"] = edate
             soup = self._get(IMPR_LIST_URL, params=params)
-            rows = soup.select(".bd-list table tbody tr")
+            rows = soup.select("table.list-data tbody tr")
             if not rows:
                 break
             for row in rows:
@@ -284,22 +299,36 @@ class FssCrawler:
         상세페이지 안의 file-list__set__item (/fss.hpdownload?... 또는 fileDown.do 링크)에서 얻어야 한다.
         """
         soup = self._get(doc.detail_url)
+
+        # 본문 영역: .contents > .tbl-view 테이블, 또는 .contents 전체
+        content_el = soup.select_one(".contents") or soup.select_one("main") or soup.body
         parts = []
-        for dl in soup.select(".bd-view dl"):
-            dt = dl.find("dt")
-            dd = dl.find("dd")
-            if dt and dd:
-                parts.append(f"{dt.get_text(strip=True)}: {dd.get_text(' ', strip=True)}")
+        if content_el:
+            # dl/dt/dd 구조가 있으면 그것을 우선 파싱
+            for dl in content_el.select("dl"):
+                dt = dl.find("dt")
+                dd = dl.find("dd")
+                if dt and dd:
+                    parts.append(f"{dt.get_text(strip=True)}: {dd.get_text(' ', strip=True)}")
+            # tbl-view 테이블(th/td 쌍)도 파싱
+            for row in content_el.select("table.tbl-view tr, table tr"):
+                th = row.find("th")
+                td = row.find("td")
+                if th and td:
+                    parts.append(f"{th.get_text(strip=True)}: {td.get_text(' ', strip=True)}")
+            if not parts:
+                # 파싱 못 하면 텍스트만
+                parts.append(content_el.get_text("\n", strip=True)[:3000])
         text = "\n".join(parts)
 
         attachments: list[Attachment] = []
-        for a in soup.select(".bd-view .file-list__set__item a, .bd-view a.file-single"):
-            href = a.get("href")
-            if not href:
-                continue
-            name_el = a.select_one(".name")
-            name = name_el.get_text(strip=True) if name_el else a.get("title", "첨부파일")
-            attachments.append(Attachment(title=name, url=urljoin(BASE_URL, href)))
+        search_el = content_el if content_el else soup
+        for a in search_el.find_all("a", href=True):
+            href = a["href"]
+            if _is_file_link(href) or "fileDown" in href or "hpdownload" in href.lower():
+                name_el = a.select_one(".name")
+                name = name_el.get_text(strip=True) if name_el else (a.get("title") or a.get_text(strip=True) or "첨부파일")
+                attachments.append(Attachment(title=name[:80], url=urljoin(BASE_URL, href)))
         return text, attachments
 
     # ---------------------------------------------------------------- 파일 저장
@@ -351,6 +380,7 @@ class FssCrawler:
         start: str | None = None,
         end: str | None = None,
         company: str | None = None,
+        sanction_years: int = 3,
     ):
         """감사 기간 범위를 정하는 우선순위:
 
@@ -362,6 +392,10 @@ class FssCrawler:
 
         company가 주어지면 검사결과제재/경영유의사항 게시판을 업권 키워드 대신 해당 기관명으로만
         필터링한다(특정 회사 감사이므로 동일 업권 타사 건은 근거에서 제외).
+
+        sanction_years: 제재·경영유의사항 수집 기간을 감사기간과 독립적으로 오늘 기준 최근 N년으로
+        확장한다(기본 3년). 관련 사례는 감사기간 외 기간도 참고해야 하기 때문이다.
+        검사업무안내서(업권 전체 문서)는 감사기간(rng["years"])으로만 조회한다.
         """
         assert industry in INDUSTRY_CODES, f"알 수 없는 업권: {industry}"
 
@@ -374,13 +408,27 @@ class FssCrawler:
                 window_months = max_window_months
             rng = compute_period_range(period, window_months)
 
+        # 제재·경영유의사항은 최근 sanction_years년 전체를 수집한다 (감사기간과 독립적)
+        today = date.today()
+        try:
+            sanction_start = today.replace(year=today.year - sanction_years).isoformat()
+        except ValueError:
+            # 윤년(2월 29일) 예외 처리
+            import datetime as _dt
+            sanction_start = (today - _dt.timedelta(days=sanction_years * 365)).isoformat()
+        sanction_rng = {"sdate": sanction_start, "edate": today.isoformat()}
+
         results = {
             "검사업무안내서": self.fetch_manuals(industry, manual_pages, years=rng["years"]),
             "검사결과제재": self.fetch_sanctions(
-                industry, sanction_pages, sdate=rng["sdate"], edate=rng["edate"], company=company
+                industry, sanction_pages,
+                sdate=sanction_rng["sdate"], edate=sanction_rng["edate"],
+                company=company,
             ),
             "경영유의사항": self.fetch_impr(
-                industry, impr_pages, sdate=rng["sdate"], edate=rng["edate"], company=company
+                industry, impr_pages,
+                sdate=sanction_rng["sdate"], edate=sanction_rng["edate"],
+                company=company,
             ),
         }
         for docs in results.values():
@@ -403,6 +451,9 @@ if __name__ == "__main__":
     parser.add_argument("--start", default=None, help="YYYY-MM-DD, --end와 함께 주어지면 감사 기간을 그대로 사용(근사 없음)")
     parser.add_argument("--end", default=None, help="YYYY-MM-DD, --start와 함께 사용")
     parser.add_argument("--company", default=None, help="특정 기관명, 주어지면 제재/경영유의사항을 해당 기관으로만 필터링")
+    parser.add_argument("--sanction-years", type=int, default=3,
+                        help="제재·경영유의사항을 오늘 기준 최근 N년으로 수집 (기본 3년). "
+                             "감사기간(--start/--end)과 독립적으로 적용된다.")
     args = parser.parse_args()
 
     crawler = FssCrawler(args.out)
@@ -416,6 +467,7 @@ if __name__ == "__main__":
         start=args.start,
         end=args.end,
         company=args.company,
+        sanction_years=args.sanction_years,
     )
     for cat, docs in result.items():
         print(f"[{cat}] {len(docs)}건 저장 완료")
